@@ -68,6 +68,9 @@ class DigitalOceanAPIError(Exception):
         super().__init__(message)
 
 
+PROTECTED_TAGS = {"owner", "firewall"}
+
+
 class DigitalOceanAPI:
     """Client for DigitalOcean REST API."""
 
@@ -875,15 +878,26 @@ class DigitalOceanAPI:
         Raises:
             DigitalOceanAPIError: If tagging fails
         """
-        payload = {
-            "resources": [
-                {
-                    "resource_id": resource_id,
-                    "resource_type": resource_type,
-                }
-            ]
-        }
+        payload = {"resources": [{"resource_id": resource_id, "resource_type": resource_type}]}
         self._request("POST", f"/tags/{tag_name}/resources", json=payload)
+
+    def untag_resource(self, tag_name: str, resource_id: str, resource_type: str) -> None:
+        """
+        Remove a tag from a resource.
+
+        Args:
+            tag_name: Tag name to remove
+            resource_id: Resource ID (string for snapshots/images)
+            resource_type: Resource type ('image' for snapshots, 'droplet', etc.)
+
+        Raises:
+            ValueError: If tag is protected (owner or firewall)
+            DigitalOceanAPIError: If untagging fails
+        """
+        if tag_name.split(":")[0] in PROTECTED_TAGS:
+            raise ValueError(f"Cannot remove protected tag: {tag_name}")
+        payload = {"resources": [{"resource_id": resource_id, "resource_type": resource_type}]}
+        self._request("DELETE", f"/tags/{tag_name}/resources", json=payload)
 
     def create_tag(self, tag_name: str) -> dict[str, Any]:
         """
