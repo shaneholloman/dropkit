@@ -1,4 +1,5 @@
 #cloud-config
+# Warning: This whole file will be evaluated by Jinja. Escape any special literals (`{{`, `{%`, `{#`).
 
 # Update and upgrade system packages
 package_update: true
@@ -47,7 +48,7 @@ write_files:
     defer: true
     content: |
       # Prompt: user@host:dir (green for normal, red after failed command)
-      PROMPT='%F{%(?.green.red)}%n@%m%f:%F{blue}%~%f$ '
+      {% raw %}PROMPT='%F{%(?.green.red)}%n@%m%f:%F{blue}%~%f$ '{% endraw %}
 
       # History
       HISTFILE=~/.zsh_history
