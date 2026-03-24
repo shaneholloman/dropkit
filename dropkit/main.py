@@ -3362,14 +3362,31 @@ def resize(
         current_table.add_column(style="dim")
         current_table.add_column(style="white")
 
-        current_vcpus = current_size_info.get("vcpus", "N/A")
-        current_memory = current_size_info.get("memory", "N/A")
-        current_disk = current_size_info.get("disk", "N/A")
+        # Use the droplet's actual resource values, not the size spec's.
+        # After a --no-disk resize, the size spec reflects the new tier
+        # (e.g. 80 GB disk for s-2vcpu-4gb) while the droplet's actual
+        # resources may differ (e.g. still 25 GB disk).
+        current_vcpus = droplet.get("vcpus", current_size_info.get("vcpus", "N/A"))
+        current_memory = droplet.get("memory", current_size_info.get("memory", "N/A"))
+        current_disk = droplet.get("disk", current_size_info.get("disk", "N/A"))
         current_price = current_size_info.get("price_monthly", 0)
 
         current_table.add_row("vCPUs:", str(current_vcpus))
         current_table.add_row("Memory:", f"{current_memory} MB")
-        current_table.add_row("Disk:", f"{current_disk} GB")
+        # Show hint when actual disk is smaller than the size spec
+        # (happens after a previous --no-disk resize)
+        spec_disk = current_size_info.get("disk")
+        if (
+            isinstance(current_disk, int)
+            and isinstance(spec_disk, int)
+            and current_disk < spec_disk
+        ):
+            current_table.add_row(
+                "Disk:",
+                f"{current_disk} GB [dim](size spec: {spec_disk} GB, disk was not resized)[/dim]",
+            )
+        else:
+            current_table.add_row("Disk:", f"{current_disk} GB")
         current_table.add_row("Price:", f"${current_price:.2f}/month")
 
         console.print(current_table)
