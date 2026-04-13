@@ -3291,8 +3291,8 @@ def rename(
 def resize(
     droplet_name: str = typer.Argument(..., autocompletion=complete_droplet_or_snapshot_name),
     size: str | None = typer.Option(None, "--size", "-s", help="New size slug (e.g., s-4vcpu-8gb)"),
-    disk: bool = typer.Option(
-        True, "--disk/--no-disk", help="Resize disk (permanent, default: True)"
+    disk: bool | None = typer.Option(
+        None, "--disk/--no-disk", help="Resize disk (permanent, asked interactively if omitted)"
     ),
 ):
     """
@@ -3493,13 +3493,36 @@ def resize(
             if isinstance(new_disk, int) and isinstance(current_disk, int)
             else 0
         )
+
+        # If --disk/--no-disk was not explicitly passed, ask interactively
+        # when the new size has a different disk.  This surfaces the
+        # permanent/irreversible nature of disk resize at decision time,
+        # consistent with how region/size/image are handled interactively.
+        # Resolved BEFORE building the table so the row reflects the choice.
+        if disk is None:
+            if disk_diff != 0:
+                console.print()
+                console.print(
+                    "[bold yellow]Disk resize is PERMANENT and cannot be undone.[/bold yellow]"
+                )
+                console.print("[dim]Skipping disk resize keeps the option to downsize later.[/dim]")
+                disk_choice = Prompt.ask(
+                    "[bold]Resize disk too?[/bold]",
+                    choices=["yes", "no"],
+                    default="no",
+                )
+                disk = disk_choice == "yes"
+            else:
+                # No disk change — default to True (no-op for disk)
+                disk = True
+
         disk_change = f"{current_disk} GB → {new_disk} GB"
-        if disk and disk_diff > 0:
-            disk_change += f" [green](+{disk_diff} GB)[/green]"
-        elif disk and disk_diff < 0:
-            disk_change += f" [yellow]({disk_diff} GB)[/yellow]"
-        elif not disk:
+        if disk is False:
             disk_change = f"{current_disk} GB (not resized)"
+        elif disk_diff > 0:
+            disk_change += f" [green](+{disk_diff} GB)[/green]"
+        elif disk_diff < 0:
+            disk_change += f" [yellow]({disk_diff} GB)[/yellow]"
         changes_table.add_row("Disk:", disk_change)
 
         # Price
@@ -3516,16 +3539,17 @@ def resize(
         # Show warnings
         console.print()
         console.print(
-            "[bold yellow]⚠ WARNING: This operation will cause downtime (droplet will be powered off)[/bold yellow]"
+            "[bold yellow]⚠ WARNING: This operation will cause downtime "
+            "(droplet will be powered off)[/bold yellow]"
         )
 
-        if disk:
+        if disk and disk_diff > 0:
             console.print(
                 "[bold red]⚠ WARNING: Disk resize is PERMANENT and cannot be undone![/bold red]"
             )
-        else:
+        elif not disk:
             console.print(
-                "[dim]Note: Disk will NOT be resized. You can resize it later, but it's permanent.[/dim]"
+                "[dim]Note: Disk will NOT be resized. You can resize back down later.[/dim]"
             )
 
         # Confirmation
@@ -3562,9 +3586,37 @@ def resize(
             api.wait_for_action_complete(action_id, timeout=600)  # 10 minutes
 
         console.print("[green]✓[/green] Resize completed successfully")
+
+        # Power the droplet back on — DigitalOcean leaves it powered off
+        # after resize (no auto-power-on API flag exists).  Since the user
+        # almost certainly wants their droplet running, we power it on
+        # automatically instead of leaving them to discover it's off.
+        console.print()
+        console.print("[dim]Powering on droplet...[/dim]")
+
+        power_action = api.power_on_droplet(droplet_id)
+        power_action_id = power_action.get("id")
+
+        if not power_action_id:
+            console.print(
+                "[yellow]Warning: Could not get power-on action ID. "
+                f"You may need to run: dropkit on {droplet_name}[/yellow]"
+            )
+        else:
+            console.print(
+                f"[green]✓[/green] Power on action started (ID: [cyan]{power_action_id}[/cyan])"
+            )
+            console.print("[dim]Waiting for droplet to power on...[/dim]")
+
+            with console.status("[cyan]Powering on...[/cyan]"):
+                api.wait_for_action_complete(power_action_id, timeout=120)
+
+            console.print("[green]✓[/green] Droplet powered on successfully")
+
         console.print()
         console.print(
-            f"[bold green]Droplet {droplet_name} has been resized to {new_size_slug}[/bold green]"
+            f"[bold green]Droplet {droplet_name} has been resized to "
+            f"{new_size_slug} and is now active[/bold green]"
         )
 
     except DigitalOceanAPIError as e:
