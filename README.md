@@ -107,6 +107,36 @@ Commands:
 
 Use `dropkit <command> --help` for detailed help on any command.
 
+### Machine-readable output
+
+Read commands render formatted tables by default. For scripting and agents,
+pass `--json` to emit untruncated structured data instead. Supported on
+`list`, `info`, `list-ssh-keys`, and `version`:
+
+```bash
+dropkit list --json | jq -r '.droplets[].name'
+dropkit info my-droplet --json | jq -r '.ip'
+dropkit list-ssh-keys --json | jq -r '.ssh_keys[].fingerprint'
+```
+
+- **`list --json`** — each droplet's `id`, `name`, `status`, `ip`,
+  `tailscale_ip`, `region`, `size`, `cost_monthly`, `in_ssh_config`,
+  `ssh_hostname`, and `tags`, plus a `hibernated` list and `total_monthly_cost`.
+- **`info --json`** — the `list` fields plus `created_at`, `vcpus`,
+  `memory_mb`, `disk_gb`, `transfer_tb`, `image`, `features`, and full
+  `networks` (including IPv6).
+- **`list-ssh-keys --json`** — `username` and an `ssh_keys` list of
+  `name`/`id`/`fingerprint`.
+- **`version --json`** — the dropkit `version` string.
+
+For command execution errors, `--json` keeps `stdout` a clean JSON stream: the
+error is written to `stderr` as `{"error": "..."}` and the command exits non-zero.
+Argument parsing errors still use Typer's normal usage output. Numeric fields
+are `null` when the value is unknown (e.g. `cost_monthly` is `null` for a size
+with no price, distinct from `0` for a genuinely free resource). The list's
+`total_monthly_cost` is `null` if any resource cost is unknown. Update notices
+are suppressed in JSON mode.
+
 ## Listing and filtering options
 
 At any region, size, image, or project prompt, `?` lists the available choices.

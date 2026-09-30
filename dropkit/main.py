@@ -46,11 +46,33 @@ console = Console()
 # https://docs.digitalocean.com/products/snapshots/details/pricing/
 SNAPSHOT_COST_PER_GB_MONTHLY = 0.06
 
+JSON_HELP = "Emit machine-readable JSON instead of formatted output (for scripting and agents)"
+
+
+def emit_json(payload: Any) -> None:
+    """Print a payload as formatted JSON on stdout for scripting and agents."""
+    sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+
+
+def emit_error(message: str, *, json_output: bool) -> None:
+    """Report an error, honoring JSON mode.
+
+    In JSON mode, emit a ``{"error": ...}`` object so stdout stays a clean JSON
+    stream for consumers piping to ``jq``. Otherwise preserve the usual console output.
+    """
+    if json_output:
+        sys.stderr.write(json.dumps({"error": message}, indent=2) + "\n")
+    else:
+        console.print(f"[red]Error: {message}[/red]")
+
 
 @app.callback()
-def main_callback():
+def main_callback(ctx: typer.Context):
     """Run before any command - checks for updates once per day."""
-    check_for_updates()
+    # Commands with --json handle the update notice after parsing their own
+    # options, so it cannot contaminate a JSON response or error stream.
+    if ctx.invoked_subcommand not in {"list", "ls", "info", "list-ssh-keys", "version"}:
+        check_for_updates()
 
 
 # Helper functions
@@ -205,7 +227,7 @@ def complete_droplet_or_snapshot_name(incomplete: str) -> list[str]:
     return list(dict.fromkeys(droplet_names + snapshot_names))
 
 
-def load_config_and_api() -> tuple[Config, DigitalOceanAPI]:
+def load_config_and_api(*, json_output: bool = False) -> tuple[Config, DigitalOceanAPI]:
     """
     Load configuration and create API client.
 
@@ -216,17 +238,24 @@ def load_config_and_api() -> tuple[Config, DigitalOceanAPI]:
         typer.Exit: If config doesn't exist or fails to load
     """
     if not Config.exists():
-        console.print("[red]Error: Config not found. Run 'dropkit init' first.[/red]")
+        if json_output:
+            emit_error("Config not found. Run 'dropkit init' first.", json_output=True)
+        else:
+            console.print("[red]Error: Config not found. Run 'dropkit init' first.[/red]")
         raise typer.Exit(1)
 
     config_manager = Config()
     try:
         config_manager.load()
     except Exception as e:
-        console.print(f"[red]Error loading config: {e}[/red]")
-        console.print(
-            "[yellow]Config file may be invalid. Try running[/yellow] [cyan]dropkit init --force[/cyan]"
-        )
+        if json_output:
+            emit_error(f"loading config: {e}. Try running dropkit init --force", json_output=True)
+        else:
+            console.print(f"[red]Error loading config: {e}[/red]")
+            console.print(
+                "[yellow]Config file may be invalid. Try running[/yellow] "
+                "[cyan]dropkit init --force[/cyan]"
+            )
         raise typer.Exit(1)
 
     config = config_manager.config
@@ -1543,7 +1572,9 @@ def setup_tailscale(
     return tailscale_ip
 
 
-def find_user_droplet(api: DigitalOceanAPI, droplet_name: str) -> tuple[dict | None, str]:
+def find_user_droplet(
+    api: DigitalOceanAPI, droplet_name: str, *, json_output: bool = False
+) -> tuple[dict | None, str]:
     """
     Find a droplet by name, filtered by current user's tag.
 
@@ -1560,7 +1591,10 @@ def find_user_droplet(api: DigitalOceanAPI, droplet_name: str) -> tuple[dict | N
     try:
         username = api.get_username()
     except DigitalOceanAPIError as e:
-        console.print(f"[red]Error fetching username from DigitalOcean: {e}[/red]")
+        if json_output:
+            emit_error(f"fetching username from DigitalOcean: {e}", json_output=True)
+        else:
+            console.print(f"[red]Error fetching username from DigitalOcean: {e}[/red]")
         raise typer.Exit(1)
 
     # Get droplets tagged with this user
@@ -1568,7 +1602,10 @@ def find_user_droplet(api: DigitalOceanAPI, droplet_name: str) -> tuple[dict | N
         tag_name = get_user_tag(username)
         droplets = api.list_droplets(tag_name=tag_name)
     except DigitalOceanAPIError as e:
-        console.print(f"[red]Error listing droplets: {e}[/red]")
+        if json_output:
+            emit_error(f"listing droplets: {e}", json_output=True)
+        else:
+            console.print(f"[red]Error listing droplets: {e}[/red]")
         raise typer.Exit(1)
 
     # Find droplet by name
@@ -2250,21 +2287,44 @@ def create(
 @app.command(name="ls", hidden=True)
 def list_droplets(
     cost: bool = typer.Option(True, "--cost/--no-cost", help="Show monthly cost column"),
+    json_output: bool = typer.Option(False, "--json", help=JSON_HELP),
 ):
     """List droplets and hibernated snapshots tagged with owner:<username>."""
+    if not json_output:
+        check_for_updates()
     try:
         # Load config and API
-        config_manager, api = load_config_and_api()
+        config_manager, api = load_config_and_api(json_output=json_output)
         config = config_manager.config
 
         # Get username from DigitalOcean for tag filtering
         try:
             username = api.get_username()
         except DigitalOceanAPIError as e:
-            console.print(f"[red]Error fetching username from DigitalOcean: {e}[/red]")
+            emit_error(f"fetching username from DigitalOcean: {e}", json_output=json_output)
             raise typer.Exit(1)
 
         tag_name = get_user_tag(username)
+
+        if json_output:
+            droplets = api.list_droplets(tag_name=tag_name)
+            hibernated = get_user_hibernated_snapshots(api, tag_name)
+            droplet_records = [build_droplet_record(d, config.ssh.config_path) for d in droplets]
+            hibernated_records = [build_hibernated_record(s) for s in hibernated]
+            costs = [r["cost_monthly"] for r in (*droplet_records, *hibernated_records)]
+            known_costs = [value for value in costs if value is not None]
+            total_monthly_cost = (
+                round(sum(known_costs), 2) if len(known_costs) == len(costs) else None
+            )
+            emit_json(
+                {
+                    "tag": tag_name,
+                    "droplets": droplet_records,
+                    "hibernated": hibernated_records,
+                    "total_monthly_cost": total_monthly_cost,
+                }
+            )
+            return
 
         console.print(f"[dim]Fetching resources with tag: [cyan]{tag_name}[/cyan][/dim]\n")
 
@@ -2390,8 +2450,108 @@ def list_droplets(
             )
 
     except DigitalOceanAPIError as e:
-        console.print(f"[red]Error: {e}[/red]")
+        emit_error(str(e), json_output=json_output)
         raise typer.Exit(1)
+
+
+def build_droplet_record(droplet: dict[str, Any], ssh_config_path: str) -> dict[str, Any]:
+    """Extract the agent-relevant fields from a raw droplet API object.
+
+    Missing values are represented as ``None`` rather than placeholder strings
+    so JSON consumers can branch on them cleanly. The one exception is ``name``,
+    which falls back to an empty string because it seeds the SSH hostname.
+    ``cost_monthly`` stays ``None`` when the size carries no price, so a genuine
+    ``$0`` resource is distinguishable from one with an unknown price.
+    """
+    name = droplet.get("name", "")
+
+    ip_address = None
+    for network in (droplet.get("networks") or {}).get("v4", []):
+        if network.get("type") == "public":
+            ip_address = network.get("ip_address")
+            break
+
+    ssh_hostname = get_ssh_hostname(name)
+    in_ssh_config = host_exists(ssh_config_path, ssh_hostname)
+    ssh_ip = get_ssh_host_ip(ssh_config_path, ssh_hostname)
+    tailscale_ip = ssh_ip if ssh_ip and is_tailscale_ip(ssh_ip) else None
+
+    price_monthly = (droplet.get("size") or {}).get("price_monthly")
+
+    return {
+        "id": droplet.get("id"),
+        "name": name,
+        "status": droplet.get("status"),
+        "ip": ip_address,
+        "tailscale_ip": tailscale_ip,
+        "region": (droplet.get("region") or {}).get("slug"),
+        "size": droplet.get("size_slug"),
+        "cost_monthly": float(price_monthly) if price_monthly is not None else None,
+        "in_ssh_config": in_ssh_config,
+        "ssh_hostname": ssh_hostname,
+        "tags": droplet.get("tags", []),
+    }
+
+
+def build_hibernated_record(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Extract the agent-relevant fields from a hibernated-snapshot API object."""
+    snapshot_name = snapshot.get("name", "")
+    droplet_name = get_droplet_name_from_snapshot(snapshot_name) or snapshot_name
+
+    droplet_size = None
+    for tag in snapshot.get("tags", []):
+        if tag.startswith("size:"):
+            droplet_size = tag.removeprefix("size:")
+
+    raw_size_gb = snapshot.get("size_gigabytes")
+    size_gb = float(raw_size_gb) if raw_size_gb is not None else None
+    regions = snapshot.get("regions", [])
+
+    return {
+        "name": droplet_name,
+        "snapshot_name": snapshot_name,
+        "droplet_size": droplet_size,
+        "image_size_gb": size_gb,
+        "region": regions[0] if regions else None,
+        "cost_monthly": size_gb * SNAPSHOT_COST_PER_GB_MONTHLY if size_gb is not None else None,
+    }
+
+
+def build_droplet_detail(droplet: dict[str, Any], ssh_config_path: str) -> dict[str, Any]:
+    """Build the detailed droplet record emitted by ``info --json``.
+
+    Extends :func:`build_droplet_record` with hardware specs, image details,
+    timestamps, and full network data (including IPv6).
+    """
+    record = build_droplet_record(droplet, ssh_config_path)
+    size = droplet.get("size") or {}
+    image = droplet.get("image") or {}
+    record.update(
+        {
+            "created_at": droplet.get("created_at"),
+            "vcpus": size.get("vcpus"),
+            "memory_mb": size.get("memory"),
+            "disk_gb": size.get("disk"),
+            "transfer_tb": size.get("transfer"),
+            "image": {
+                "distribution": image.get("distribution"),
+                "name": image.get("name"),
+                "slug": image.get("slug"),
+            },
+            "features": droplet.get("features", []),
+            "networks": droplet.get("networks", {}),
+        }
+    )
+    return record
+
+
+def build_ssh_key_record(key: dict[str, Any]) -> dict[str, Any]:
+    """Extract the agent-relevant fields from an SSH key API object."""
+    return {
+        "name": key.get("name"),
+        "id": key.get("id"),
+        "fingerprint": key.get("fingerprint"),
+    }
 
 
 @app.command()
@@ -2485,26 +2645,38 @@ def config_ssh(
 
 
 @app.command()
-def info(droplet_name: str = typer.Argument(..., autocompletion=complete_droplet_name)):
+def info(
+    droplet_name: str = typer.Argument(..., autocompletion=complete_droplet_name),
+    json_output: bool = typer.Option(False, "--json", help=JSON_HELP),
+):
     """Show detailed information about a droplet."""
+    if not json_output:
+        check_for_updates()
     try:
         # Load config and API
-        config_manager, api = load_config_and_api()
+        config_manager, api = load_config_and_api(json_output=json_output)
         config = config_manager.config
 
         # Find the droplet
-        console.print(f"[dim]Looking for droplet: [cyan]{droplet_name}[/cyan][/dim]\n")
-        droplet, username = find_user_droplet(api, droplet_name)
+        if not json_output:
+            console.print(f"[dim]Looking for droplet: [cyan]{droplet_name}[/cyan][/dim]\n")
+        droplet, username = find_user_droplet(api, droplet_name, json_output=json_output)
 
         if not droplet:
             tag = get_user_tag(username)
-            console.print(f"[red]Error: Droplet '{droplet_name}' not found with tag {tag}[/red]")
+            emit_error(
+                f"Droplet '{droplet_name}' not found with tag {tag}", json_output=json_output
+            )
             raise typer.Exit(1)
 
         # Get detailed droplet info
         droplet_id = droplet.get("id")
         if droplet_id:
             droplet = api.get_droplet(droplet_id)
+
+        if json_output:
+            emit_json(build_droplet_detail(droplet, config.ssh.config_path))
+            return
 
         # Display information in a nice format
         console.print(
@@ -2626,7 +2798,7 @@ def info(droplet_name: str = typer.Argument(..., autocompletion=complete_droplet
             console.print(f"  [dim]Manual SSH: ssh root@{public_ip}[/dim]")
 
     except DigitalOceanAPIError as e:
-        console.print(f"[red]Error: {e}[/red]")
+        emit_error(str(e), json_output=json_output)
         raise typer.Exit(1)
 
 
@@ -4406,29 +4578,43 @@ def enable_tailscale(
 
 
 @app.command(name="list-ssh-keys")
-def list_ssh_keys_cmd():
+def list_ssh_keys_cmd(
+    json_output: bool = typer.Option(False, "--json", help=JSON_HELP),
+):
     """List SSH keys registered via dropkit.
 
     Use 'dropkit add-ssh-key' to add or import additional SSH keys.
     """
+    if not json_output:
+        check_for_updates()
     try:
         # Load config and API
-        _, api = load_config_and_api()
+        _, api = load_config_and_api(json_output=json_output)
 
         # Get username from DigitalOcean for filtering
         try:
             username = api.get_username()
         except DigitalOceanAPIError as e:
-            console.print(f"[red]Error fetching username from DigitalOcean: {e}[/red]")
+            emit_error(f"fetching username from DigitalOcean: {e}", json_output=json_output)
             raise typer.Exit(1)
 
         # Fetch all SSH keys
-        console.print("[dim]Fetching SSH keys from DigitalOcean...[/dim]\n")
+        if not json_output:
+            console.print("[dim]Fetching SSH keys from DigitalOcean...[/dim]\n")
         all_keys = api.list_ssh_keys()
 
         # Filter keys registered via dropkit (prefixed with dropkit-{username}-)
         prefix = f"dropkit-{username}-"
         dropkit_keys = [key for key in all_keys if key.get("name", "").startswith(prefix)]
+
+        if json_output:
+            emit_json(
+                {
+                    "username": username,
+                    "ssh_keys": [build_ssh_key_record(key) for key in dropkit_keys],
+                }
+            )
+            return
 
         if not dropkit_keys:
             console.print(
@@ -4457,7 +4643,7 @@ def list_ssh_keys_cmd():
         console.print(f"\n[dim]Total: {len(dropkit_keys)} key(s)[/dim]")
 
     except DigitalOceanAPIError as e:
-        console.print(f"[red]Error: {e}[/red]")
+        emit_error(str(e), json_output=json_output)
         raise typer.Exit(1)
 
 
@@ -4657,10 +4843,17 @@ def delete_ssh_key_cmd(
 
 
 @app.command()
-def version():
+def version(
+    json_output: bool = typer.Option(False, "--json", help=JSON_HELP),
+):
     """Show the version of dropkit."""
     from dropkit import __version__
 
+    if json_output:
+        emit_json({"version": __version__})
+        return
+
+    check_for_updates()
     console.print(f"dropkit version [cyan]{__version__}[/cyan]")
 
 
